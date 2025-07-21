@@ -5,6 +5,9 @@
 #define STB_DS_IMPLEMENTATION
 #include "stb_ds.h"
 
+ShaderSourceEntry* g_shader_source_map = NULL;
+char g_cache_dir[256];
+
 // --- Helper Functions ---
 
 // Creates the cache directory if it doesn't exist.

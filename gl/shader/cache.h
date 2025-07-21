@@ -15,8 +15,8 @@ typedef struct {
     char* value; // The source code string
 } ShaderSourceEntry;
 
-static ShaderSourceEntry* g_shader_source_map = NULL;
-static char g_cache_dir[256];
+extern ShaderSourceEntry* g_shader_source_map;
+extern char g_cache_dir[256];
 
 void shader_cache_init();
 void shader_cache_shutdown();

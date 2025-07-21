@@ -1,13 +1,23 @@
 #include "gles.h"
 #include "translate.h"
 #include "cache.h"
+#include "state.h"
 #include <stdio.h>
-
+#include <GL/glcorearb.h>
 #define UNIMPLEMENTED() \
+    do { \
+        static int warned_unimpl = 0; \
+        if (!warned_unimpl) { \
+            fprintf(stderr, "GLT ERROR [%s]: Not yet implemented!\n", __func__); \
+            warned_unimpl = 1; \
+        } \
+    } while (0)
+
+#define WARN(msg) \
     do { \
         static int warned = 0; \
         if (!warned) { \
-            fprintf(stderr, "GL STUB: %s is not yet implemented!\n", __func__); \
+            fprintf(stderr, "GLT WARN [%s]: %s\n", __func__, msg); \
             warned = 1; \
         } \
     } while (0)
@@ -16,12 +26,123 @@
 extern "C" {
 #endif
 
+// Internal implementation goes here, to prevent name collision
+static void* glMapBufferRange_internal(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    if ((access & GL_MAP_PERSISTENT_BIT) && !gles.ext.glBufferStorageEXT) {
+        WARN("OpenGL 4.4's immutable buffer storage is requested but GLES driver does not support EXT_buffer_storage, proceed with normal buffer storage.");
+        access &= ~(GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+    }
+
+    return gles.core.glMapBufferRange(target, offset, length, access);
+}
+
+static void* glMapBuffer_internal(GLenum target, GLenum access) {
+    if(gles.ext.glMapBufferOES) return gles.ext.glMapBufferOES(target, access);
+    GLint size;
+    gles.core.glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+    GLbitfield access_flags = 0;
+    if (access == GL_READ_ONLY)  access_flags = GL_MAP_READ_BIT;
+    if (access == GL_WRITE_ONLY) access_flags = GL_MAP_WRITE_BIT;
+    if (access == GL_READ_WRITE) access_flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
+    return glMapBufferRange_internal(target, 0, size, access_flags);
+}
+
+static void glBindFramebuffer_internal(GLenum target, GLuint framebuffer) {
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+        if (gl_state.draw_fbo == framebuffer) return;
+        gl_state.draw_fbo = framebuffer;
+    }
+    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+        if (gl_state.read_fbo == framebuffer) return;
+        gl_state.read_fbo = framebuffer;
+    }
+
+    gles.core.glBindFramebuffer(target, framebuffer);
+}
+
+static void glBindBuffer_internal(GLenum target, GLuint buffer) {
+    switch (target) {
+        case GL_ARRAY_BUFFER:
+            if (gl_state.array_buffer == buffer) return;
+            gl_state.array_buffer = buffer;
+            break;
+        case GL_ELEMENT_ARRAY_BUFFER:
+            // This one is tricky because it's part of the VAO state.
+            // For now, let's cache it, but be aware of this dependency.
+            if (gl_state.element_array_buffer == buffer) return;
+            gl_state.element_array_buffer = buffer;
+            break;
+        case GL_COPY_READ_BUFFER:
+            if (gl_state.copy_read_buffer == buffer) return;
+            gl_state.copy_read_buffer = buffer;
+            break;
+        case GL_COPY_WRITE_BUFFER:
+            if (gl_state.copy_write_buffer == buffer) return;
+            gl_state.copy_write_buffer = buffer;
+            break;
+        case GL_UNIFORM_BUFFER:
+            if (gl_state.uniform_buffer == buffer) return;
+            gl_state.uniform_buffer = buffer;
+            break;
+        // Add other targets as you support them
+        default:
+            // For targets we don't cache, just call through.
+            // Or, you could decide to cache all of them.
+            break;
+    }
+    gles.core.glBindBuffer(target, buffer);
+}
+
+void glGetBufferSubData_internal(GLenum target, GLintptr offset, GLsizeiptr size, void *data) {
+    void* map_ptr = NULL;
+    gles.core.glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &map_ptr);
+    if (map_ptr != NULL) {
+        memcpy(data, (char*)map_ptr + offset, size);
+    } else {
+        map_ptr = gles.core.glMapBufferRange(target, offset, size, GL_MAP_READ_BIT);
+        if (map_ptr) {
+            memcpy(data, map_ptr, size);
+            gles.core.glUnmapBuffer(target);
+        }
+    }
+}
+
+static void glActiveTexture_internal(GLenum texture) {
+    gl_state.active_texture_unit = texture;
+    gles.core.glActiveTexture(texture);
+}
+
+static void glBindTexture_internal(GLenum target, GLuint texture) {
+    GLenum real_target = get_gles_texture_target(target);
+    if (real_target == GL_NONE) return;
+
+    GLuint* cached_binding = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    if (!cached_binding || *cached_binding == texture) {
+        if (texture != 0 && hmgeti(texture_target_map, texture) == -1) {
+            hmput(texture_target_map, texture, target);
+        }
+        if (!cached_binding) {
+             gles.core.glBindTexture(real_target, texture);
+        }
+        return;
+    }
+
+    *cached_binding = texture;
+    if (texture != 0 && hmgeti(texture_target_map, texture) == -1) {
+        hmput(texture_target_map, texture, target);
+    }
+
+    gles.core.glBindTexture(real_target, texture);
+}
+
+// Actual implementation goes here
+
 void glActiveShaderProgram(GLuint pipeline, GLuint program) {
     gles.core.glActiveShaderProgram(pipeline, program);
 }
 
 void glActiveTexture(GLenum texture) {
-    gles.core.glActiveTexture(texture);
+    glActiveTexture_internal(texture);
 }
 
 void glAttachShader(GLuint program, GLuint shader) {
@@ -50,7 +171,7 @@ void glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) {
 }
 
 void glBindBuffer(GLenum target, GLuint buffer) {
-    gles.core.glBindBuffer(target, buffer);
+    glBindBuffer_internal(target, buffer);
 }
 
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
@@ -88,7 +209,7 @@ void glBindFragDataLocationIndexed(GLuint program, GLuint colorNumber, GLuint in
 }
 
 void glBindFramebuffer(GLenum target, GLuint framebuffer) {
-    gles.core.glBindFramebuffer(target, framebuffer);
+    glBindFramebuffer_internal(target, framebuffer);
 }
 
 void glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum format) {
@@ -116,7 +237,7 @@ void glBindSamplers(GLuint first, GLsizei count, const GLuint *samplers) {
 }
 
 void glBindTexture(GLenum target, GLuint texture) {
-    gles.core.glBindTexture(target, texture);
+    glBindTexture_internal(target, texture);
 }
 
 void glBindTextureUnit(GLuint unit, GLuint texture) {
@@ -184,17 +305,24 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
 }
 
 void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) {
-    GLint old_read_fbo, old_draw_fbo;
-    gles.core.glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read_fbo);
-    gles.core.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw_fbo);
+    GLuint old_read_fbo = gl_state.read_fbo;
+    GLuint old_draw_fbo = gl_state.draw_fbo;
 
-    gles.core.glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebuffer);
-    gles.core.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
+    if (old_read_fbo != readFramebuffer) {
+        glBindFramebuffer_internal(GL_READ_FRAMEBUFFER, readFramebuffer);
+    }
+    if (old_draw_fbo != drawFramebuffer) {
+        glBindFramebuffer_internal(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
+    }
 
     gles.core.glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 
-    gles.core.glBindFramebuffer(GL_READ_FRAMEBUFFER, old_read_fbo);
-    gles.core.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, old_draw_fbo);
+    if (old_read_fbo != readFramebuffer) {
+        glBindFramebuffer_internal(GL_READ_FRAMEBUFFER, old_read_fbo);
+    }
+    if (old_draw_fbo != drawFramebuffer) {
+        glBindFramebuffer_internal(GL_DRAW_FRAMEBUFFER, old_draw_fbo);
+    }
 }
 
 void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
@@ -215,8 +343,23 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 }
 
 GLenum glCheckNamedFramebufferStatus(GLuint framebuffer, GLenum target) {
-    UNIMPLEMENTED();
-    return 0; // FIXME: Add a proper return value!
+    GLuint currently_bound_fbo;
+    if (target == GL_READ_FRAMEBUFFER) {
+        currently_bound_fbo = gl_state.read_fbo;
+    } else { // GL_DRAW_FRAMEBUFFER or GL_FRAMEBUFFER
+        currently_bound_fbo = gl_state.draw_fbo;
+    }
+
+    if (currently_bound_fbo == framebuffer) {
+        return gles.core.glCheckFramebufferStatus(target);
+    }
+
+    GLuint old_fbo = currently_bound_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    GLenum status = gles.core.glCheckFramebufferStatus(target);
+    glBindFramebuffer_internal(target, old_fbo);
+
+    return status;
 }
 
 void glClampColor(GLenum target, GLenum clamp) {
@@ -339,7 +482,7 @@ void glCompileShader(GLuint shader) {
 }
 
 void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLint border, GLsizei imageSize, const void *data) {
-    UNIMPLEMENTED();
+    gles.core.glCompressedTexImage2D(GL_TEXTURE_2D, level, internalformat, width, 1, border, imageSize, data);
 }
 
 void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void *data) {
@@ -351,7 +494,7 @@ void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, G
 }
 
 void glCompressedTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data) {
-    UNIMPLEMENTED();
+    gles.core.glCompressedTexSubImage2D(GL_TEXTURE_2D, level, xoffset, 0, width, 1, format, imageSize, data);
 }
 
 void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data) {
@@ -363,15 +506,37 @@ void glCompressedTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint 
 }
 
 void glCompressedTextureSubImage1D(GLuint texture, GLint level, GLint xoffset, GLsizei width, GLenum format, GLsizei imageSize, const void *data) {
-    UNIMPLEMENTED();
+    GLuint* p_old_texture = get_cached_texture_binding(GL_TEXTURE_2D, gl_state.active_texture_unit);
+
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(GL_TEXTURE_2D, texture);
+    gles.core.glCompressedTexSubImage2D(GL_TEXTURE_2D, level, xoffset, 0, width, 1, format, imageSize, data);
+    glBindTexture_internal(GL_TEXTURE_2D, old_texture);
 }
 
 void glCompressedTextureSubImage2D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glCompressedTexSubImage2D(real_target, level, xoffset, yoffset, width, height, format, imageSize, data);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glCompressedTextureSubImage3D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize, const void *data) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glCompressedTexSubImage3D(real_target, level, xoffset, yoffset, zoffset, width, height, depth, format, imageSize, data);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
@@ -383,11 +548,20 @@ void glCopyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint 
 }
 
 void glCopyNamedBufferSubData(GLuint readBuffer, GLuint writeBuffer, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
-    UNIMPLEMENTED();
+    GLuint old_read_buffer = gl_state.copy_read_buffer;
+    GLuint old_write_buffer = gl_state.copy_write_buffer;
+
+    glBindBuffer_internal(GL_COPY_READ_BUFFER, readBuffer);
+    glBindBuffer_internal(GL_COPY_WRITE_BUFFER, writeBuffer);
+
+    gles.core.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, readOffset, writeOffset, size);
+
+    glBindBuffer_internal(GL_COPY_READ_BUFFER, old_read_buffer);
+    glBindBuffer_internal(GL_COPY_WRITE_BUFFER, old_write_buffer);
 }
 
 void glCopyTexImage1D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border) {
-    UNIMPLEMENTED();
+    gles.core.glCopyTexImage2D(GL_TEXTURE_2D, level, internalformat, x, y, width, 1, border);
 }
 
 void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border) {
@@ -395,7 +569,7 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x
 }
 
 void glCopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width) {
-    UNIMPLEMENTED();
+    gles.core.glCopyTexSubImage2D(GL_TEXTURE_2D, level, xoffset, 0, x, y, width, 1);
 }
 
 void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
@@ -407,15 +581,38 @@ void glCopyTexSubImage3D(GLenum target, GLint level, GLint xoffset, GLint yoffse
 }
 
 void glCopyTextureSubImage1D(GLuint texture, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width) {
-    UNIMPLEMENTED();
+    // Use 2D texture to emulate
+    GLuint* p_old_texture = get_cached_texture_binding(GL_TEXTURE_2D, gl_state.active_texture_unit);
+
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(GL_TEXTURE_2D, texture);
+    gles.core.glCopyTexSubImage2D(GL_TEXTURE_2D, level, xoffset, 0, x, y, width, 1);
+    glBindTexture_internal(GL_TEXTURE_2D, old_texture);
 }
 
 void glCopyTextureSubImage2D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glCopyTexSubImage2D(real_target, level, xoffset, yoffset, x, y, width, height);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glCopyTextureSubImage3D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glCopyTexSubImage3D(real_target, level, xoffset, yoffset, zoffset, x, y, width, height);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glCreateBuffers(GLsizei n, GLuint *buffers) {
@@ -455,7 +652,10 @@ GLuint glCreateShaderProgramv(GLenum type, GLsizei count, const GLchar *const *s
 }
 
 void glCreateTextures(GLenum target, GLsizei n, GLuint *textures) {
-    UNIMPLEMENTED();
+    gles.core.glGenTextures(n, textures);
+    for (int i = 0; i < n; ++i) {
+        hmput(texture_target_map, textures[i], target);
+    }
 }
 
 void glCreateTransformFeedbacks(GLsizei n, GLuint *ids) {
@@ -520,6 +720,47 @@ void glDeleteSync(GLsync sync) {
 }
 
 void glDeleteTextures(GLsizei n, const GLuint *textures) {
+    if (!textures || n <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        GLuint texture_to_delete = textures[i];
+        if (texture_to_delete == 0) {
+            continue;
+        }
+
+        hmdel(texture_target_map, texture_to_delete);
+
+        for (int unit = 0; unit < MAX_TEXTURE_UNITS; ++unit) {
+            // Check each cached target in the unit.
+            if (gl_state.texture_units[unit].texture_2d == texture_to_delete) {
+                gl_state.texture_units[unit].texture_2d = 0;
+            }
+            if (gl_state.texture_units[unit].texture_2d_array == texture_to_delete) {
+                gl_state.texture_units[unit].texture_2d = 0;
+            }
+            if (gl_state.texture_units[unit].texture_2d_multisample == texture_to_delete) {
+                gl_state.texture_units[unit].texture_2d = 0;
+            }
+            if (gl_state.texture_units[unit].texture_2d_multisample_array == texture_to_delete) {
+                gl_state.texture_units[unit].texture_2d = 0;
+            }
+            if (gl_state.texture_units[unit].texture_3d == texture_to_delete) {
+                gl_state.texture_units[unit].texture_3d = 0;
+            }
+            if (gl_state.texture_units[unit].texture_cube_map == texture_to_delete) {
+                gl_state.texture_units[unit].texture_cube_map = 0;
+            }
+            if (gl_state.texture_units[unit].texture_cube_map_array == texture_to_delete) {
+                gl_state.texture_units[unit].texture_cube_map = 0;
+            }
+            if (gl_state.texture_units[unit].texture_buffer == texture_to_delete) {
+                gl_state.texture_units[unit].texture_buffer = 0;
+            }
+        }
+    }
+
     gles.core.glDeleteTextures(n, textures);
 }
 
@@ -714,12 +955,10 @@ void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length)
 }
 
 void glFlushMappedNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length) {
-    const GLenum target = GL_ARRAY_BUFFER;
-    GLint old_buffer;
-    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-    gles.core.glBindBuffer(target, buffer);
-    gles.core.glFlushMappedBufferRange(target, offset, length);
-    gles.core.glBindBuffer(target, old_buffer);
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    gles.core.glFlushMappedBufferRange(GL_ARRAY_BUFFER, offset, length);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
 }
 
 void glFramebufferParameteri(GLenum target, GLenum pname, GLint param) {
@@ -796,7 +1035,19 @@ void glGenerateMipmap(GLenum target) {
 }
 
 void glGenerateTextureMipmap(GLuint texture) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    if (original_target == GL_NONE) return;
+
+    GLenum real_target = get_gles_texture_target(original_target);
+    if (real_target == GL_NONE) return;
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    if (!p_old_texture) { UNIMPLEMENTED(); return; }
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glGenerateMipmap(real_target);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glGetActiveAtomicCounterBufferiv(GLuint program, GLuint bufferIndex, GLenum pname, GLint *params) {
@@ -868,7 +1119,7 @@ void glGetBufferPointerv(GLenum target, GLenum pname, void **params) {
 }
 
 void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data) {
-    UNIMPLEMENTED();
+    glGetBufferSubData_internal(target, offset, size, data);
 }
 
 void glGetCompressedTexImage(GLenum target, GLint level, void *img) {
@@ -957,27 +1208,59 @@ void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
 }
 
 void glGetNamedBufferParameteri64v(GLuint buffer, GLenum pname, GLint64 *params) {
-    UNIMPLEMENTED();
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    gles.core.glGetBufferParameteri64v(GL_ARRAY_BUFFER, pname, params);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
 }
 
 void glGetNamedBufferParameteriv(GLuint buffer, GLenum pname, GLint *params) {
-    UNIMPLEMENTED();
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    gles.core.glGetBufferParameteriv(GL_ARRAY_BUFFER, pname, params);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
 }
 
 void glGetNamedBufferPointerv(GLuint buffer, GLenum pname, void **params) {
-    UNIMPLEMENTED();
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    gles.core.glGetBufferPointerv(GL_ARRAY_BUFFER, pname, params);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
 }
 
 void glGetNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, void *data) {
-    UNIMPLEMENTED();
+    GLuint old_buffer = gl_state.copy_read_buffer;
+    glBindBuffer_internal(GL_COPY_READ_BUFFER, buffer);
+    glGetBufferSubData_internal(GL_COPY_READ_BUFFER, offset, size, data);
+    glBindBuffer_internal(GL_COPY_READ_BUFFER, old_buffer);
 }
 
 void glGetNamedFramebufferAttachmentParameteriv(GLuint framebuffer, GLenum attachment, GLenum pname, GLint *params) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glGetFramebufferAttachmentParameteriv(target, attachment, pname, params);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glGetFramebufferAttachmentParameteriv(target, attachment, pname, params);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glGetNamedFramebufferParameteriv(GLuint framebuffer, GLenum pname, GLint *param) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glGetFramebufferParameteriv(target, pname, param);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glGetFramebufferParameteriv(target, pname, param);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glGetNamedRenderbufferParameteriv(GLuint renderbuffer, GLenum pname, GLint *params) {
@@ -1213,27 +1496,75 @@ void glGetTextureImage(GLuint texture, GLint level, GLenum format, GLenum type, 
 }
 
 void glGetTextureLevelParameterfv(GLuint texture, GLint level, GLenum pname, GLfloat *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glGetTexLevelParameterfv(real_target, level, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glGetTextureLevelParameteriv(GLuint texture, GLint level, GLenum pname, GLint *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glGetTexLevelParameteriv(real_target, level, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glGetTextureParameterIiv(GLuint texture, GLenum pname, GLint *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glGetTexParameterIiv(real_target, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glGetTextureParameterIuiv(GLuint texture, GLenum pname, GLuint *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glGetTexParameterIuiv(real_target, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glGetTextureParameterfv(GLuint texture, GLenum pname, GLfloat *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glGetTexParameterfv(real_target, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glGetTextureParameteriv(GLuint texture, GLenum pname, GLint *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glGetTexParameteriv(real_target, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glGetTextureSubImage(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, GLsizei bufSize, void *pixels) {
@@ -1513,40 +1844,27 @@ void glLogicOp(GLenum opcode) {
 }
 
 void * glMapBuffer(GLenum target, GLenum access) {
-    if(gles.ext.glMapBufferOES) return gles.ext.glMapBufferOES(target, access);
-    GLint size;
-    gles.core.glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
-    GLbitfield access_flags = 0;
-    if (access == GL_READ_ONLY)  access_flags = GL_MAP_READ_BIT;
-    if (access == GL_WRITE_ONLY) access_flags = GL_MAP_WRITE_BIT;
-    if (access == GL_READ_WRITE) access_flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
-    return gles.core.glMapBufferRange(target, 0, size, access_flags);
+    return glMapBuffer_internal(target, access);
 }
 
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
-    if ((access & GL_MAP_PERSISTENT_BIT_EXT) && !gles.ext.glBufferStorageEXT) {
-        access &= ~(GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
-    }
-
-    return gles.core.glMapBufferRange(target, offset, length, access);
+    return glMapBufferRange_internal(target, offset, length, access);
 }
 
-void * glMapNamedBuffer(GLuint buffer, GLenum access) {
-    UNIMPLEMENTED();
-    return NULL;
+void *glMapNamedBuffer(GLuint buffer, GLenum access) {
+    const GLenum target = GL_ARRAY_BUFFER;
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(target, buffer);
+    void *ptr = glMapBuffer_internal(target, access);
+    glBindBuffer_internal(target, old_buffer);
+    return ptr;
 }
 
 void * glMapNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length, GLbitfield access) {
-    const GLenum target = GL_ARRAY_BUFFER;
-    void* mapped_ptr = NULL;
-    GLint old_buffer;
-    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-    gles.core.glBindBuffer(target, buffer);
-    if ((access & GL_MAP_PERSISTENT_BIT_EXT) && !gles.ext.glBufferStorageEXT) {
-        access &= ~(GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
-    }
-    mapped_ptr = gles.core.glMapBufferRange(target, offset, length, access);
-    gles.core.glBindBuffer(target, old_buffer);
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    void* mapped_ptr = glMapBufferRange_internal(GL_ARRAY_BUFFER, offset, length, access);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
     return mapped_ptr;
 }
 
@@ -1628,66 +1946,129 @@ void glMultiTexCoordP4uiv(GLenum texture, GLenum type, const GLuint *coords) {
 }
 
 void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void *data, GLenum usage) {
-    UNIMPLEMENTED();
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    gles.core.glBufferData(GL_ARRAY_BUFFER, size, data, usage);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
 }
 
 void glNamedBufferStorage(GLuint buffer, GLsizeiptr size, const void *data, GLbitfield flags) {
-    const GLenum target = GL_ARRAY_BUFFER;
-    GLint old_buffer;
-    if(gles.ext.glBufferStorageEXT) {
-        gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-        gles.core.glBindBuffer(target, buffer);
-        gles.ext.glBufferStorageEXT(target, size, data, flags);
-        gles.core.glBindBuffer(target, old_buffer);
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+
+    if (gles.ext.glBufferStorageEXT) {
+        gles.ext.glBufferStorageEXT(GL_ARRAY_BUFFER, size, data, flags);
+    } else {
+        gles.core.glBufferData(GL_ARRAY_BUFFER, size, data, GL_STATIC_DRAW);
     }
-    else {
-        gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-        gles.core.glBindBuffer(target, buffer);
-        gles.core.glBufferData(target, size, data, GL_STATIC_DRAW);
-        gles.core.glBindBuffer(target, old_buffer);
-    }
+
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
 }
 
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void *data) {
-    const GLenum target = GL_ARRAY_BUFFER;
-    GLint old_buffer;
-    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-    gles.core.glBindBuffer(target, buffer);
-    gles.core.glBufferSubData(target, offset, size, data);
-    gles.core.glBindBuffer(target, old_buffer);
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    gles.core.glBufferSubData(GL_ARRAY_BUFFER, offset, size, data);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
 }
 
 void glNamedFramebufferDrawBuffer(GLuint framebuffer, GLenum buf) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+    const GLenum bufs[] = { buf }; // GLES uses glDrawBuffers
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glDrawBuffers(1, bufs);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glDrawBuffers(1, bufs);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glNamedFramebufferDrawBuffers(GLuint framebuffer, GLsizei n, const GLenum *bufs) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glDrawBuffers(n, bufs);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glDrawBuffers(n, bufs);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glNamedFramebufferParameteri(GLuint framebuffer, GLenum pname, GLint param) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glFramebufferParameteri(target, pname, param);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glFramebufferParameteri(target, pname, param);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glNamedFramebufferReadBuffer(GLuint framebuffer, GLenum src) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_READ_FRAMEBUFFER;
+
+    if (gl_state.read_fbo == framebuffer) {
+        gles.core.glReadBuffer(src);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.read_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glReadBuffer(src);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glNamedFramebufferRenderbuffer(GLuint framebuffer, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glNamedFramebufferTexture(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level) {
-    const GLenum target = GL_FRAMEBUFFER;
-    GLint old_fbo;
-    gles.core.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fbo);
-    gles.core.glBindFramebuffer(target, framebuffer);
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glFramebufferTexture(target, attachment, texture, level);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
     gles.core.glFramebufferTexture(target, attachment, texture, level);
-    gles.core.glBindFramebuffer(target, old_fbo);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glNamedFramebufferTextureLayer(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level, GLint layer) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_DRAW_FRAMEBUFFER;
+
+    if (gl_state.draw_fbo == framebuffer) {
+        gles.core.glFramebufferTextureLayer(target, attachment, texture, level, layer);
+        return;
+    }
+
+    GLuint old_fbo = gl_state.draw_fbo;
+    glBindFramebuffer_internal(target, framebuffer);
+    gles.core.glFramebufferTextureLayer(target, attachment, texture, level, layer);
+    glBindFramebuffer_internal(target, old_fbo);
 }
 
 void glNamedRenderbufferStorage(GLuint renderbuffer, GLenum internalformat, GLsizei width, GLsizei height) {
@@ -2009,26 +2390,6 @@ void glReadBuffer(GLenum src) {
 }
 
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) {
-    GLint pack_buffer = 0;
-    // Check if a Pixel Buffer Object is bound to the pixel pack target.
-    gles.core.glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
-
-    // If a PBO is bound, and the 'pixels' argument is a small integer, it's being
-    // used as an offset into the PBO, which is the trigger for this operation.
-    if (pack_buffer != 0) {
-        // A non-zero 'pixels' value when a PBO is bound is treated as an offset.
-        // Even if the offset is 0, the operation is still a PBO transfer.
-        
-        printf("[Layer] PBO is bound for glReadPixels. Forcing unmap to prevent 'PBO is mapped' error.\n");
-        
-        // Unmap the buffer on the application's behalf.
-        GLboolean unmap_result = gles.core.glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-        
-        if (unmap_result == GL_FALSE) {
-            // This is a more serious problem, but we should still try to continue.
-            fprintf(stderr, "[Layer] WARNING: Implicit unmap of PBO failed before glReadPixels. The driver may still error.\n");
-        }
-    }
     gles.core.glReadPixels(x, y, width, height, format, type, pixels);
 }
 
@@ -2288,7 +2649,7 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint *params) {
 }
 
 void glTexStorage1D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width) {
-    UNIMPLEMENTED();
+    gles.core.glTexStorage2D(GL_TEXTURE_2D, levels, internalformat, width, 1);
 }
 
 void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
@@ -2308,7 +2669,7 @@ void glTexStorage3DMultisample(GLenum target, GLsizei samples, GLenum internalfo
 }
 
 void glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels) {
-    UNIMPLEMENTED();
+    gles.core.glTexSubImage2D(GL_TEXTURE_2D, level, xoffset, 0, width, 1, format, type, pixels);
 }
 
 void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
@@ -2324,31 +2685,87 @@ void glTextureBarrier(void) {
 }
 
 void glTextureBuffer(GLuint texture, GLenum internalformat, GLuint buffer) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexBuffer(real_target, internalformat, buffer);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureBufferRange(GLuint texture, GLenum internalformat, GLuint buffer, GLintptr offset, GLsizeiptr size) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexBufferRange(real_target, internalformat, buffer, offset, size);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureParameterIiv(GLuint texture, GLenum pname, const GLint *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexParameterIiv(real_target, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureParameterIuiv(GLuint texture, GLenum pname, const GLuint *params) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexParameterIuiv(real_target, pname, params);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureParameterf(GLuint texture, GLenum pname, GLfloat param) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexParameterf(real_target, pname, param);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureParameterfv(GLuint texture, GLenum pname, const GLfloat *param) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexParameterfv(real_target, pname, param);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureParameteri(GLuint texture, GLenum pname, GLint param) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexParameteri(real_target, pname, param);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureParameteriv(GLuint texture, GLenum pname, const GLint *param) {
@@ -2356,35 +2773,97 @@ void glTextureParameteriv(GLuint texture, GLenum pname, const GLint *param) {
 }
 
 void glTextureStorage1D(GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width) {
-    UNIMPLEMENTED();
+    // Use 2D texture to emulate
+    GLuint* p_old_texture = get_cached_texture_binding(GL_TEXTURE_2D, gl_state.active_texture_unit);
+
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(GL_TEXTURE_2D, texture);
+    gles.core.glTexStorage2D(GL_TEXTURE_2D, levels, internalformat, width, 1);
+    glBindTexture_internal(GL_TEXTURE_2D, old_texture);
 }
 
 void glTextureStorage2D(GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexStorage2D(real_target, levels, internalformat, width, height);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureStorage2DMultisample(GLuint texture, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexStorage2DMultisample(real_target, samples, internalformat, width, height, fixedsamplelocations);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureStorage3D(GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexStorage3D(real_target, levels, internalformat, width, height, depth);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureStorage3DMultisample(GLuint texture, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexStorage3DMultisample(real_target, samples, internalformat, width, height, depth, fixedsamplelocations);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureSubImage1D(GLuint texture, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels) {
-    UNIMPLEMENTED();
+    // Use 2D texture to emulate
+    GLuint* p_old_texture = get_cached_texture_binding(GL_TEXTURE_2D, gl_state.active_texture_unit);
+
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(GL_TEXTURE_2D, texture);
+    gles.core.glTexSubImage2D(GL_TEXTURE_2D, level, xoffset, 0, width, 1, format, type, pixels);
+    glBindTexture_internal(GL_TEXTURE_2D, old_texture);
 }
 
 void glTextureSubImage2D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexSubImage2D(real_target, level, xoffset, yoffset, width, height, format, type, pixels);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureSubImage3D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels) {
-    UNIMPLEMENTED();
+    GLenum original_target = get_texture_target(texture);
+    GLenum real_target = get_gles_texture_target(original_target);
+
+    GLuint* p_old_texture = get_cached_texture_binding(real_target, gl_state.active_texture_unit);
+    GLuint old_texture = *p_old_texture;
+
+    glBindTexture_internal(real_target, texture);
+    gles.core.glTexSubImage3D(real_target, level, xoffset, yoffset, zoffset, width, height, depth, format, type, pixels);
+    glBindTexture_internal(real_target, old_texture);
 }
 
 void glTextureView(GLuint texture, GLenum target, GLuint origtexture, GLenum internalformat, GLuint minlevel, GLuint numlevels, GLuint minlayer, GLuint numlayers) {
@@ -2617,15 +3096,10 @@ GLboolean glUnmapBuffer(GLenum target) {
 }
 
 GLboolean glUnmapNamedBuffer(GLuint buffer) {
-    const GLenum target = GL_ARRAY_BUFFER;
-    GLboolean result;
-
-    GLint old_buffer;
-    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-    gles.core.glBindBuffer(target, buffer);
-    result = gles.core.glUnmapBuffer(target);
-    gles.core.glBindBuffer(target, old_buffer);
-
+    GLuint old_buffer = gl_state.array_buffer;
+    glBindBuffer_internal(GL_ARRAY_BUFFER, buffer);
+    GLboolean result = gles.core.glUnmapBuffer(GL_ARRAY_BUFFER);
+    glBindBuffer_internal(GL_ARRAY_BUFFER, old_buffer);
     return result;
 }
 
