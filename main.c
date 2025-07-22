@@ -1,5 +1,6 @@
 #include "gles.h" // The one header to rule them all
 #include "cache.h"
+#include "state.h"
 #include <stdlib.h>
 
 static void* gles_handle = NULL;

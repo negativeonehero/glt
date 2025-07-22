@@ -1,9 +1,16 @@
 #ifndef TRANSLATE_H
 #define TRANSLATE_H
 
-#include <stdlib.h>
-#include <string.h>
+#include <GLES3/gl32.h>
 
-char* shader_translate(GLenum shader_type, const char* original_source);
-
+#ifdef __cplusplus
+extern "C" {
 #endif
+
+char* shader_translate(GLenum shader_type, const char* source);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // TRANSLATE_H

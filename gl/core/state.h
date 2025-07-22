@@ -31,6 +31,7 @@ typedef struct {
         GLuint texture_cube_map_array;
         GLuint texture_buffer;
     } texture_units[MAX_TEXTURE_UNITS];
+    GLenum polygon_mode;
 } gl_state_t;
 
 extern gl_state_t gl_state;
