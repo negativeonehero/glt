@@ -1,7 +1,10 @@
+#define _GNU_SOURCE
+
 #include "gles.h" // To get access to the 'egl' struct
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 
 // We need the real X11 and GLX headers for type definitions
 #include <X11/Xlib.h>
@@ -14,6 +17,9 @@ static EGLConfig  g_egl_config = NULL;
 static EGLContext g_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
 static GLXDrawable g_current_drawable = 0;
+
+// Handle to our own library, to prevent symbol leakage from libGL.so
+static void* g_self_handle = NULL;
 
 
 // --- Helper Functions ---
@@ -107,6 +113,7 @@ GLXContext glXCreateContextAttribsARB(Display* dpy,
     printf("[Bridge] Intercepted glXCreateContextAttribsARB\n");
     (void)dpy; (void)direct; // Unused parameters
 
+    ensure_egl_display(dpy);
     EGLConfig egl_config = (EGLConfig)config;
 
     // If the application didn't provide a config, we must choose a default one.
@@ -117,6 +124,7 @@ GLXContext glXCreateContextAttribsARB(Display* dpy,
         GLXFBConfig* configs = glXChooseFBConfig(dpy, 0, NULL, &nelements);
         if (nelements > 0 && configs) {
             egl_config = (EGLConfig)configs[0];
+            // ToDo: The 'configs' array is leaked here. A real implementation should manage this memory.
         } else {
             fprintf(stderr, "[Bridge] Could not find a default EGLConfig for context creation.\n");
             return NULL;
@@ -186,6 +194,11 @@ GLXContext glXCreateNewContext(Display *dpy, GLXFBConfig config, int render_type
 
 GLXContext glXCreateContext(Display* dpy, XVisualInfo* vis, GLXContext share_list, Bool direct) {
     printf("[Bridge] Intercepted legacy glXCreateContext. Forwarding to ARB version with default attributes.\n");
+    // In a real implementation, you might need to find an EGLConfig that matches the XVisualInfo.
+    // For this simple bridge, we assume a compatible config was already found and stored in g_egl_config.
+    if (g_egl_config == NULL) {
+        fprintf(stderr, "[Bridge] Error: legacy glXCreateContext called before a config was chosen.\n");
+    }
     return glXCreateContextAttribsARB(dpy, (GLXFBConfig)g_egl_config, share_list, direct, NULL);
 }
 
@@ -203,6 +216,7 @@ Bool glXMakeCurrent(Display* dpy, GLXDrawable drawable, GLXContext ctx) {
 
 Bool glXMakeContextCurrent(Display* dpy, GLXDrawable draw, GLXDrawable read, GLXContext ctx) {
     printf("[Bridge] Intercepted glXMakeContextCurrent for draw=0x%lx, read=0x%lx\n", draw, read);
+    (void)dpy; // dpy is not used with EGL
 
     EGLContext egl_ctx = (EGLContext)ctx;
     EGLSurface egl_draw_surface = EGL_NO_SURFACE;
@@ -274,6 +288,8 @@ const char* glXQueryExtensionsString(Display* dpy, int screen) {
     }
     
     printf("[Bridge] Reporting EGL extensions as GLX extensions.\n");
+    // A more complete implementation might append its own emulated extensions,
+    // like GLX_ARB_create_context.
     return exts;
 }
 
@@ -303,9 +319,18 @@ Bool glXIsDirect(Display *dpy, GLXContext ctx) {
     return True;
 }
 
+// Forward declaration for glXGetProcAddressARB
+void (*glXGetProcAddress(const GLubyte *procname))();
+
+// Some apps use the ARB version, so we just make it an alias.
+void (*glXGetProcAddressARB(const GLubyte *procname))() {
+    return glXGetProcAddress(procname);
+}
+
 void (*glXGetProcAddress(const GLubyte *procname))() {
     const char* name = (const char*)procname;
     printf("[Bridge] Intercepted glXGetProcAddress for: %s\n", name);
+
     // --- Step 1: Check for our own implemented GLX functions first. ---
     // This is the most important part: we explicitly return pointers to our
     // own bridge functions, preventing any system versions from being used.
@@ -321,15 +346,37 @@ void (*glXGetProcAddress(const GLubyte *procname))() {
     if (strcmp(name, "glXQueryExtension") == 0) return (void (*)())glXQueryExtension;
     if (strcmp(name, "glXCreateNewContext") == 0) return (void (*)())glXCreateNewContext;
     if (strcmp(name, "glXGetProcAddress") == 0) return (void (*)())glXGetProcAddress;
-    if (strcmp(name, "glXGetProcAddressARB") == 0) return (void (*)())glXGetProcAddressARB;
+    // Fix for potential recursion: glXGetProcAddressARB should point to the main function.
+    if (strcmp(name, "glXGetProcAddressARB") == 0) return (void (*)())glXGetProcAddress;
     if (strcmp(name, "glXIsDirect") == 0) return (void (*)())glXIsDirect;
     // Add any other GLX functions you implement here...
 
+    // --- Step 2: Check for core GL functions we have stubbed in THIS library. ---
+    // This is the critical fix. We use a handle to our own library to ensure
+    // we don't accidentally load a real OpenGL function from the system's libGL.
+    if (g_self_handle == NULL) {
+        // One-time initialization. Get a handle to our own .so file.
+        // We use dladdr to find the path of our library from a known function symbol.
+        Dl_info info;
+        if (dladdr((void*)glXGetProcAddress, &info)) {
+            // Now open our own library to get a handle for dlsym.
+            // RTLD_LAZY: resolve symbols as code is executed.
+            // RTLD_NOLOAD: don't load the library if it's not already loaded (it will be).
+            g_self_handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+        }
+        if (g_self_handle == NULL) {
+            fprintf(stderr, "[Bridge] FATAL: Could not get a handle to our own library. %s\n", dlerror());
+            // We cannot proceed safely.
+        }
+    }
 
-    // --- Step 2: Check for core GL functions we have stubbed. ---
-    // dlsym(RTLD_DEFAULT, ...) will find the functions in our opengl_stubs.c
-    // because we are loaded with LD_PRELOAD. This is safe.
-    void* func = dlsym(RTLD_DEFAULT, name);
+    void* func = NULL;
+    if (g_self_handle) {
+        // Use our own handle to find symbols. This will find functions in your
+        // opengl_stubs.c but will NOT find them in the system libGL.so.1.
+        func = dlsym(g_self_handle, name);
+    }
+    
     if (func) {
         return (void (*)())func;
     }
@@ -349,9 +396,4 @@ void (*glXGetProcAddress(const GLubyte *procname))() {
     // this function, preventing the "leak" of a real GLX function pointer.
     fprintf(stderr, "[Bridge] glXGetProcAddress: Returning NULL for unsupported function '%s'\n", name);
     return NULL;
-}
-
-// Some apps use the ARB version, so we just make it an alias.
-void (*glXGetProcAddressARB(const GLubyte *procname))() {
-    return glXGetProcAddress(procname);
 }

@@ -16,6 +16,27 @@
 extern "C" {
 #endif
 
+// Reusable implementations marked "internal"
+void * glMapBufferRange_internal(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    if ((access & GL_MAP_PERSISTENT_BIT_EXT) && !gles.ext.glBufferStorageEXT) {
+        access &= ~(GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
+    }
+
+    return gles.core.glMapBufferRange(target, offset, length, access);
+}
+
+void * glMapBuffer_internal(GLenum target, GLenum access) {
+    if(gles.ext.glMapBufferOES) return gles.ext.glMapBufferOES(target, access);
+    GLint size;
+    gles.core.glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+    GLbitfield access_flags = 0;
+    if (access == GL_READ_ONLY)  access_flags = GL_MAP_READ_BIT;
+    if (access == GL_WRITE_ONLY) access_flags = GL_MAP_WRITE_BIT;
+    if (access == GL_READ_WRITE) access_flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
+    return gles.core.glMapBufferRange(target, 0, size, access_flags);
+}
+
+// GL API implementation
 void glActiveShaderProgram(GLuint pipeline, GLuint program) {
     gles.core.glActiveShaderProgram(pipeline, program);
 }
@@ -256,7 +277,7 @@ void glClearColor(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha) {
 }
 
 void glClearDepth(GLdouble depth) {
-    UNIMPLEMENTED();
+    gles.core.glClearDepthf((GLfloat)depth);
 }
 
 void glClearDepthf(GLfloat d) {
@@ -601,7 +622,8 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, 
 }
 
 void glDrawBuffer(GLenum buf) {
-    UNIMPLEMENTED();
+    const GLenum bufs[] = { buf };
+    gles.core.glDrawBuffers(1, bufs);
 }
 
 void glDrawBuffers(GLsizei n, const GLenum *bufs) {
@@ -1513,27 +1535,22 @@ void glLogicOp(GLenum opcode) {
 }
 
 void * glMapBuffer(GLenum target, GLenum access) {
-    if(gles.ext.glMapBufferOES) return gles.ext.glMapBufferOES(target, access);
-    GLint size;
-    gles.core.glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
-    GLbitfield access_flags = 0;
-    if (access == GL_READ_ONLY)  access_flags = GL_MAP_READ_BIT;
-    if (access == GL_WRITE_ONLY) access_flags = GL_MAP_WRITE_BIT;
-    if (access == GL_READ_WRITE) access_flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
-    return gles.core.glMapBufferRange(target, 0, size, access_flags);
+    return glMapBuffer_internal(target, access);
 }
 
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
-    if ((access & GL_MAP_PERSISTENT_BIT_EXT) && !gles.ext.glBufferStorageEXT) {
-        access &= ~(GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
-    }
-
-    return gles.core.glMapBufferRange(target, offset, length, access);
+    return glMapBufferRange_internal(target, offset, length, access);
 }
 
 void * glMapNamedBuffer(GLuint buffer, GLenum access) {
-    UNIMPLEMENTED();
-    return NULL;
+    const GLenum target = GL_ARRAY_BUFFER;
+    void* mapped_ptr = NULL;
+    GLint old_buffer;
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    gles.core.glBindBuffer(target, buffer);
+    mapped_ptr = glMapBuffer_internal(target, access);
+    gles.core.glBindBuffer(target, old_buffer);
+    return mapped_ptr;
 }
 
 void * glMapNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length, GLbitfield access) {
@@ -1542,10 +1559,7 @@ void * glMapNamedBufferRange(GLuint buffer, GLintptr offset, GLsizeiptr length, 
     GLint old_buffer;
     gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
     gles.core.glBindBuffer(target, buffer);
-    if ((access & GL_MAP_PERSISTENT_BIT_EXT) && !gles.ext.glBufferStorageEXT) {
-        access &= ~(GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
-    }
-    mapped_ptr = gles.core.glMapBufferRange(target, offset, length, access);
+    mapped_ptr = glMapBufferRange_internal(target, offset, length, access);
     gles.core.glBindBuffer(target, old_buffer);
     return mapped_ptr;
 }
@@ -1583,7 +1597,7 @@ void glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type, const v
 
 void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count, GLenum type, const void *const *indices, GLsizei drawcount, const GLint *basevertex) {
     if(gles.ext.glMultiDrawElementsBaseVertexEXT) gles.ext.glMultiDrawElementsBaseVertexEXT(mode, count, type, indices, drawcount, basevertex);
-    else UNIMPLEMENTED();
+    else for (GLsizei i = 0; i < drawcount; ++i) if (count[i] > 0) gles.core.glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
 }
 
 void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride) {
@@ -2009,26 +2023,6 @@ void glReadBuffer(GLenum src) {
 }
 
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) {
-    GLint pack_buffer = 0;
-    // Check if a Pixel Buffer Object is bound to the pixel pack target.
-    gles.core.glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
-
-    // If a PBO is bound, and the 'pixels' argument is a small integer, it's being
-    // used as an offset into the PBO, which is the trigger for this operation.
-    if (pack_buffer != 0) {
-        // A non-zero 'pixels' value when a PBO is bound is treated as an offset.
-        // Even if the offset is 0, the operation is still a PBO transfer.
-        
-        printf("[Layer] PBO is bound for glReadPixels. Forcing unmap to prevent 'PBO is mapped' error.\n");
-        
-        // Unmap the buffer on the application's behalf.
-        GLboolean unmap_result = gles.core.glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-        
-        if (unmap_result == GL_FALSE) {
-            // This is a more serious problem, but we should still try to continue.
-            fprintf(stderr, "[Layer] WARNING: Implicit unmap of PBO failed before glReadPixels. The driver may still error.\n");
-        }
-    }
     gles.core.glReadPixels(x, y, width, height, format, type, pixels);
 }
 
