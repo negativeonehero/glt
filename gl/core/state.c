@@ -1,46 +1,51 @@
 #include "state.h"
 #include <stdio.h>
 
-gl_state_t gl_state = {0};
-texture_target_map_t *texture_target_map = NULL;
+#define STB_DS_IMPLEMENTATION
+#include "stb_ds.h"
 
-GLenum get_texture_target(GLuint texture) {
-    ptrdiff_t index = hmgeti(texture_target_map, texture);
-    return texture_target_map[index].value;
+static struct {
+    GLuint key;
+    GLenum value;
+} *g_texture_target_map = NULL;
+
+
+void state_texture_set_target(GLuint texture, GLenum target) {
+    if (texture == 0) return;
+    hmput(g_texture_target_map, texture, target);
 }
 
-GLenum get_gles_texture_target(GLenum original_target) {
-    switch (original_target) {
+GLenum state_texture_get_target(GLuint texture) {
+    if (texture == 0) return 0;
+    return hmget(g_texture_target_map, texture);
+}
+
+void state_texture_remove(GLuint texture) {
+    if (texture == 0) return;
+    hmdel(g_texture_target_map, texture);
+}
+
+GLenum get_texture_binding_from_target(GLenum target) {
+    switch (target) {
+        case GL_TEXTURE_1D:
         case GL_TEXTURE_2D:
-        case GL_TEXTURE_3D:
-        case GL_TEXTURE_2D_ARRAY:
-        case GL_TEXTURE_CUBE_MAP:
+            return GL_TEXTURE_BINDING_2D;
         case GL_TEXTURE_2D_MULTISAMPLE:
-        case GL_TEXTURE_CUBE_MAP_ARRAY:
-        case GL_TEXTURE_BUFFER:
+            return GL_TEXTURE_BINDING_2D_MULTISAMPLE;
+        case GL_TEXTURE_2D_ARRAY:
+            return GL_TEXTURE_BINDING_2D_ARRAY;
         case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
-            return original_target;
+            return GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY;
+        case GL_TEXTURE_3D:
+            return GL_TEXTURE_BINDING_3D;
+        case GL_TEXTURE_CUBE_MAP:
+            return GL_TEXTURE_BINDING_CUBE_MAP;
+        case GL_TEXTURE_CUBE_MAP_ARRAY:
+            return GL_TEXTURE_BINDING_CUBE_MAP_ARRAY;
+        case GL_TEXTURE_BUFFER:
+            return GL_TEXTURE_BINDING_BUFFER;
         default:
-            // An unknown or unsupported target.
-            fprintf(stderr, "GLT WARN: Texture target %d not supported yet.", original_target);
-            return GL_NONE;
-    }
-}
-
-GLuint* get_cached_texture_binding(GLenum real_target, GLuint unit_index) {
-    if (unit_index >= MAX_TEXTURE_UNITS) {
-        return NULL; // Invalid unit index
-    }
-
-    switch (real_target) {
-        case GL_TEXTURE_2D:			return &gl_state.texture_units[unit_index].texture_2d;
-        case GL_TEXTURE_2D_MULTISAMPLE:		return &gl_state.texture_units[unit_index].texture_2d_multisample;
-        case GL_TEXTURE_2D_ARRAY:		return &gl_state.texture_units[unit_index].texture_2d_array;
-        case GL_TEXTURE_2D_MULTISAMPLE_ARRAY: 	return &gl_state.texture_units[unit_index].texture_2d_multisample_array;
-        case GL_TEXTURE_3D:			return &gl_state.texture_units[unit_index].texture_3d;
-        case GL_TEXTURE_CUBE_MAP:		return &gl_state.texture_units[unit_index].texture_cube_map;
-        case GL_TEXTURE_CUBE_MAP_ARRAY:		return &gl_state.texture_units[unit_index].texture_cube_map_array;
-        case GL_TEXTURE_BUFFER:			return &gl_state.texture_units[unit_index].texture_buffer;
-        default:				return NULL;
+            fprintf(stderr, "Warning: unknown texture target %#x in get_texture_binding_from_target\n", target);
+            return GL_TEXTURE_BINDING_2D;
     }
 }

@@ -1,6 +1,7 @@
 #include "gles.h"
 #include "translate.h"
 #include "cache.h"
+#include "state.h"
 #include <stdio.h>
 
 #define UNIMPLEMENTED() \
@@ -137,6 +138,7 @@ void glBindSamplers(GLuint first, GLsizei count, const GLuint *samplers) {
 }
 
 void glBindTexture(GLenum target, GLuint texture) {
+    state_texture_set_target(texture, target);
     gles.core.glBindTexture(target, texture);
 }
 
@@ -236,8 +238,13 @@ GLenum glCheckFramebufferStatus(GLenum target) {
 }
 
 GLenum glCheckNamedFramebufferStatus(GLuint framebuffer, GLenum target) {
-    UNIMPLEMENTED();
-    return 0; // FIXME: Add a proper return value!
+    const GLenum fbtarget = GL_FRAMEBUFFER;
+    GLint old_fbo;
+    gles.core.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fbo);
+    gles.core.glBindFramebuffer(fbtarget, framebuffer);
+    GLenum status = gles.core.glCheckFramebufferStatus(target);
+    gles.core.glBindFramebuffer(fbtarget, old_fbo);
+    return status;
 }
 
 void glClampColor(GLenum target, GLenum clamp) {
@@ -396,7 +403,19 @@ void glCompressedTextureSubImage3D(GLuint texture, GLint level, GLint xoffset, G
 }
 
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
-    gles.core.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
+    GLint is_read_mapped = GL_FALSE;
+    gles.core.glGetBufferParameteriv(readTarget, GL_BUFFER_MAPPED, &is_read_mapped);
+
+    if (is_read_mapped) {
+        void* mapped_read_ptr = NULL;
+        gles.core.glGetBufferPointerv(readTarget, GL_BUFFER_MAP_POINTER, &mapped_read_ptr);
+        void* temp_buffer = malloc(size);
+        memcpy(temp_buffer, (char*)mapped_read_ptr + readOffset, size);
+        gles.core.glBufferSubData(writeTarget, writeOffset, size, temp_buffer);
+        free(temp_buffer);
+    } else {
+        gles.core.glCopyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
+    }
 }
 
 void glCopyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth) {
@@ -404,7 +423,15 @@ void glCopyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint 
 }
 
 void glCopyNamedBufferSubData(GLuint readBuffer, GLuint writeBuffer, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_ARRAY_BUFFER;
+    GLint old_readBuffer, old_writeBuffer;
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_readBuffer);
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_writeBuffer);
+    gles.core.glBindBuffer(target, readBuffer);
+    gles.core.glBindBuffer(target, writeBuffer);
+    gles.core.glCopyBufferSubData(readBuffer, writeBuffer, readOffset, writeOffset, size);
+    gles.core.glBindBuffer(target, old_readBuffer);
+    gles.core.glBindBuffer(target, old_writeBuffer);
 }
 
 void glCopyTexImage1D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border) {
@@ -452,19 +479,20 @@ GLuint glCreateProgram(void) {
 }
 
 void glCreateProgramPipelines(GLsizei n, GLuint *pipelines) {
-    UNIMPLEMENTED();
+    gles.core.glGenProgramPipelines(n, pipelines);
 }
 
 void glCreateQueries(GLenum target, GLsizei n, GLuint *ids) {
-    UNIMPLEMENTED();
+    // GLES glGenQueries doesn't have a target
+    gles.core.glGenQueries(n, ids);
 }
 
 void glCreateRenderbuffers(GLsizei n, GLuint *renderbuffers) {
-    UNIMPLEMENTED();
+    gles.core.glGenRenderbuffers(n, renderbuffers);
 }
 
 void glCreateSamplers(GLsizei n, GLuint *samplers) {
-    UNIMPLEMENTED();
+    gles.core.glGenSamplers(n, samplers);
 }
 
 GLuint glCreateShader(GLenum type) {
@@ -476,15 +504,18 @@ GLuint glCreateShaderProgramv(GLenum type, GLsizei count, const GLchar *const *s
 }
 
 void glCreateTextures(GLenum target, GLsizei n, GLuint *textures) {
-    UNIMPLEMENTED();
+    gles.core.glGenTextures(n, textures);
+    for (GLsizei i = 0; i < n; ++i) {
+        state_texture_set_target(textures[i], target);
+    }
 }
 
 void glCreateTransformFeedbacks(GLsizei n, GLuint *ids) {
-    UNIMPLEMENTED();
+    gles.core.glGenTransformFeedbacks(n, ids);
 }
 
 void glCreateVertexArrays(GLsizei n, GLuint *arrays) {
-    UNIMPLEMENTED();
+    gles.core.glGenVertexArrays(n, arrays);
 }
 
 void glCullFace(GLenum mode) {
@@ -541,6 +572,10 @@ void glDeleteSync(GLsync sync) {
 }
 
 void glDeleteTextures(GLsizei n, const GLuint *textures) {
+    if (!textures) return;
+    for (GLsizei i = 0; i < n; ++i) {
+        state_texture_remove(textures[i]);
+    }
     gles.core.glDeleteTextures(n, textures);
 }
 
@@ -691,7 +726,11 @@ void glEnable(GLenum cap) {
 }
 
 void glEnableVertexArrayAttrib(GLuint vaobj, GLuint index) {
-    UNIMPLEMENTED();
+    GLint old_vao;
+    gles.core.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    gles.core.glBindVertexArray(vaobj);
+    gles.core.glEnableVertexAttribArray(index);
+    gles.core.glBindVertexArray(old_vao);
 }
 
 void glEnableVertexAttribArray(GLuint index) {
@@ -818,7 +857,15 @@ void glGenerateMipmap(GLenum target) {
 }
 
 void glGenerateTextureMipmap(GLuint texture) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glGenerateMipmap(target);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glGetActiveAtomicCounterBufferiv(GLuint program, GLuint bufferIndex, GLenum pname, GLint *params) {
@@ -979,15 +1026,30 @@ void glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
 }
 
 void glGetNamedBufferParameteri64v(GLuint buffer, GLenum pname, GLint64 *params) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_ARRAY_BUFFER;
+    GLint old_buffer;
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    gles.core.glBindBuffer(target, buffer);
+    gles.core.glGetBufferParameteri64v(buffer, pname, params);
+    gles.core.glBindBuffer(target, old_buffer);
 }
 
 void glGetNamedBufferParameteriv(GLuint buffer, GLenum pname, GLint *params) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_ARRAY_BUFFER;
+    GLint old_buffer;
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    gles.core.glBindBuffer(target, buffer);
+    gles.core.glGetBufferParameteriv(buffer, pname, params);
+    gles.core.glBindBuffer(target, old_buffer);
 }
 
 void glGetNamedBufferPointerv(GLuint buffer, GLenum pname, void **params) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_ARRAY_BUFFER;
+    GLint old_buffer;
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    gles.core.glBindBuffer(target, buffer);
+    gles.core.glGetBufferPointerv(buffer, pname, params);
+    gles.core.glBindBuffer(target, old_buffer);
 }
 
 void glGetNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, void *data) {
@@ -1596,13 +1658,86 @@ void glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type, const v
 }
 
 void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count, GLenum type, const void *const *indices, GLsizei drawcount, const GLint *basevertex) {
-    if(gles.ext.glMultiDrawElementsBaseVertexEXT) gles.ext.glMultiDrawElementsBaseVertexEXT(mode, count, type, indices, drawcount, basevertex);
-    else for (GLsizei i = 0; i < drawcount; ++i) if (count[i] > 0) gles.core.glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
+    GLint program;
+    gles.core.glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    GLint draw_id_loc = gles.core.glGetUniformLocation(program, "glt_draw_id");
+
+    if (draw_id_loc != -1) {
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            if (count[i] > 0) {
+                gles.core.glUniform1i(draw_id_loc, i);
+                gles.core.glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
+            }
+        }
+    } else {
+        if(gles.ext.glMultiDrawElementsBaseVertexEXT) {
+            gles.ext.glMultiDrawElementsBaseVertexEXT(mode, count, type, indices, drawcount, basevertex);
+        } else {
+            for (GLsizei i = 0; i < drawcount; ++i) {
+                if (count[i] > 0) {
+                    gles.core.glDrawElementsBaseVertex(mode, count[i], type, indices[i], basevertex[i]);
+                }
+            }
+        }
+    }
 }
 
 void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void *indirect, GLsizei drawcount, GLsizei stride) {
-    if(gles.ext.glMultiDrawElementsIndirectEXT) gles.ext.glMultiDrawElementsIndirectEXT(mode, type, indirect, drawcount, stride);
-    else UNIMPLEMENTED();
+    // If stride is 0, the commands are tightly packed.
+    if (stride == 0) {
+        stride = 20; // sizeof(count, instanceCount, firstIndex, baseVertex, baseInstance) -> 5 * sizeof(GLuint)
+    }
+
+    GLint program;
+    gles.core.glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+
+    GLint draw_id_loc = gles.core.glGetUniformLocation(program, "glt_draw_id");
+    GLint base_instance_loc = gles.core.glGetUniformLocation(program, "glt_base_instance");
+
+    if (draw_id_loc == -1 && base_instance_loc == -1) {
+        if (gles.ext.glMultiDrawElementsIndirectEXT) {
+            gles.ext.glMultiDrawElementsIndirectEXT(mode, type, indirect, drawcount, stride);
+        } else {
+            UNIMPLEMENTED();
+        }
+        return;
+    }
+
+    if (base_instance_loc != -1) {
+        GLint indirect_buffer;
+        gles.core.glGetIntegerv(GL_DRAW_INDIRECT_BUFFER_BINDING, &indirect_buffer);
+        if (indirect_buffer == 0) return;
+
+        typedef struct {
+            GLuint count;
+            GLuint instanceCount;
+            GLuint firstIndex;
+            GLuint baseVertex;
+            GLuint baseInstance;
+        } DrawElementsIndirectCommand;
+        void* mapped_ptr = gles.core.glMapBufferRange(GL_DRAW_INDIRECT_BUFFER, (GLsizeiptr)indirect, drawcount * stride, GL_MAP_READ_BIT);
+        if (!mapped_ptr) return;
+
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            DrawElementsIndirectCommand* cmd = (DrawElementsIndirectCommand*)((uint8_t*)mapped_ptr + i * stride);
+            if (cmd->instanceCount > 0) {
+                if (draw_id_loc != -1) gles.core.glUniform1i(draw_id_loc, i);
+                gles.core.glUniform1i(base_instance_loc, cmd->baseInstance); // Set base instance from struct
+                const void* indices_ptr = (const void*)(uintptr_t)(cmd->firstIndex * sizeof(GLuint));
+                gles.core.glDrawElementsInstancedBaseVertex(mode, cmd->count, type, indices_ptr, cmd->instanceCount, cmd->baseVertex);
+            }
+        }
+        gles.core.glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER);
+
+    } else {
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            if (draw_id_loc != -1) {
+                gles.core.glUniform1i(draw_id_loc, i);
+            }
+            const void* current_indirect_offset = (const void*)((uintptr_t)indirect + i * stride);
+            gles.core.glDrawElementsIndirect(mode, type, current_indirect_offset);
+        }
+    }
 }
 
 void glMultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void *indirect, GLintptr drawcount, GLsizei maxdrawcount, GLsizei stride) {
@@ -1642,24 +1777,26 @@ void glMultiTexCoordP4uiv(GLenum texture, GLenum type, const GLuint *coords) {
 }
 
 void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void *data, GLenum usage) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_ARRAY_BUFFER;
+    GLint old_buffer;
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    gles.core.glBindBuffer(target, buffer);
+    gles.core.glBufferData(target, size, data, usage);
+    gles.core.glBindBuffer(target, old_buffer);
 }
 
 void glNamedBufferStorage(GLuint buffer, GLsizeiptr size, const void *data, GLbitfield flags) {
     const GLenum target = GL_ARRAY_BUFFER;
     GLint old_buffer;
+    gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
+    gles.core.glBindBuffer(target, buffer);
     if(gles.ext.glBufferStorageEXT) {
-        gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-        gles.core.glBindBuffer(target, buffer);
         gles.ext.glBufferStorageEXT(target, size, data, flags);
-        gles.core.glBindBuffer(target, old_buffer);
     }
     else {
-        gles.core.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
-        gles.core.glBindBuffer(target, buffer);
         gles.core.glBufferData(target, size, data, GL_STATIC_DRAW);
-        gles.core.glBindBuffer(target, old_buffer);
     }
+    gles.core.glBindBuffer(target, old_buffer);
 }
 
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void *data) {
@@ -1688,7 +1825,12 @@ void glNamedFramebufferReadBuffer(GLuint framebuffer, GLenum src) {
 }
 
 void glNamedFramebufferRenderbuffer(GLuint framebuffer, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) {
-    UNIMPLEMENTED();
+    const GLenum target = GL_FRAMEBUFFER;
+    GLint old_fbo;
+    gles.core.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fbo);
+    gles.core.glBindFramebuffer(target, framebuffer);
+    gles.core.glFramebufferRenderbuffer(framebuffer, attachment, renderbuffertarget, renderbuffer);
+    gles.core.glBindFramebuffer(target, old_fbo);
 }
 
 void glNamedFramebufferTexture(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level) {
@@ -2023,10 +2165,69 @@ void glReadBuffer(GLenum src) {
 }
 
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) {
+    GLint pbo = 0;
+    gles.core.glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pbo);
+
+    if (pbo != 0) {
+        GLint is_mapped = GL_FALSE;
+        gles.core.glGetBufferParameteriv(GL_PIXEL_PACK_BUFFER, GL_BUFFER_MAPPED, &is_mapped);
+        if (is_mapped) {
+            void* mapped_ptr = NULL;
+            gles.core.glGetBufferPointerv(GL_PIXEL_PACK_BUFFER, GL_BUFFER_MAP_POINTER, &mapped_ptr);
+            GLint pbo_size = 0;
+            gles.core.glGetBufferParameteriv(GL_PIXEL_PACK_BUFFER, GL_BUFFER_SIZE, &pbo_size);
+            GLintptr offset = (GLintptr)pixels;
+            GLsizei max_read_size = pbo_size - offset;
+            void* temp_buffer = malloc(max_read_size);
+            gles.core.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            gles.core.glReadnPixels(x, y, width, height, format, type, max_read_size, temp_buffer);
+            gles.core.glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+            memcpy((char*)mapped_ptr + offset, temp_buffer, max_read_size);
+            free(temp_buffer);
+            return;
+        }
+    }
+
+    // Default case: No PBO is bound, or it's not mapped.
     gles.core.glReadPixels(x, y, width, height, format, type, pixels);
 }
 
 void glReadnPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei bufSize, void *data) {
+    GLint pbo = 0;
+    gles.core.glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pbo);
+
+    if (pbo != 0) {
+        GLint is_mapped = GL_FALSE;
+        gles.core.glGetBufferParameteriv(GL_PIXEL_PACK_BUFFER, GL_BUFFER_MAPPED, &is_mapped);
+
+        if (is_mapped) {
+            void* mapped_ptr = NULL;
+            gles.core.glGetBufferPointerv(GL_PIXEL_PACK_BUFFER, GL_BUFFER_MAP_POINTER, &mapped_ptr);
+            if (!mapped_ptr) {
+                gles.core.glReadnPixels(x, y, width, height, format, type, bufSize, data);
+                return;
+            }
+
+            // This implementation was already correct, as it has bufSize.
+            void* temp_buffer = malloc(bufSize);
+            if (!temp_buffer) {
+                fprintf(stderr, "glReadnPixels workaround failed: could not allocate temporary buffer.\n");
+                gles.core.glReadnPixels(x, y, width, height, format, type, bufSize, data);
+                return;
+            }
+
+            gles.core.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            gles.core.glReadnPixels(x, y, width, height, format, type, bufSize, temp_buffer);
+            gles.core.glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+
+            GLintptr offset = (GLintptr)data;
+            memcpy((char*)mapped_ptr + offset, temp_buffer, bufSize);
+
+            free(temp_buffer);
+            return;
+        }
+    }
+
     gles.core.glReadnPixels(x, y, width, height, format, type, bufSize, data);
 }
 
@@ -2326,27 +2527,75 @@ void glTextureBufferRange(GLuint texture, GLenum internalformat, GLuint buffer, 
 }
 
 void glTextureParameterIiv(GLuint texture, GLenum pname, const GLint *params) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexParameterIiv(target, pname, params);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureParameterIuiv(GLuint texture, GLenum pname, const GLuint *params) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexParameterIuiv(target, pname, params);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureParameterf(GLuint texture, GLenum pname, GLfloat param) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexParameterf(target, pname, param);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureParameterfv(GLuint texture, GLenum pname, const GLfloat *param) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexParameterfv(target, pname, param);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureParameteri(GLuint texture, GLenum pname, GLint param) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexParameteri(target, pname, param);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureParameteriv(GLuint texture, GLenum pname, const GLint *param) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexParameteriv(target, pname, param);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureStorage1D(GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width) {
@@ -2354,7 +2603,15 @@ void glTextureStorage1D(GLuint texture, GLsizei levels, GLenum internalformat, G
 }
 
 void glTextureStorage2D(GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexStorage2D(target, levels, internalformat, width, height);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureStorage2DMultisample(GLuint texture, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) {
@@ -2362,7 +2619,15 @@ void glTextureStorage2DMultisample(GLuint texture, GLsizei samples, GLenum inter
 }
 
 void glTextureStorage3D(GLuint texture, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexStorage3D(target, levels, internalformat, width, height, depth);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureStorage3DMultisample(GLuint texture, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) {
@@ -2374,7 +2639,15 @@ void glTextureSubImage1D(GLuint texture, GLint level, GLint xoffset, GLsizei wid
 }
 
 void glTextureSubImage2D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
-    UNIMPLEMENTED();
+    GLenum target = state_texture_get_target(texture);
+
+    GLenum binding_target = get_texture_binding_from_target(target);
+    GLint old_texture;
+    gles.core.glGetIntegerv(binding_target, &old_texture);
+
+    gles.core.glBindTexture(target, texture);
+    gles.core.glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    gles.core.glBindTexture(target, old_texture);
 }
 
 void glTextureSubImage3D(GLuint texture, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void *pixels) {
@@ -2640,15 +2913,27 @@ void glValidateProgramPipeline(GLuint pipeline) {
 }
 
 void glVertexArrayAttribBinding(GLuint vaobj, GLuint attribindex, GLuint bindingindex) {
-    UNIMPLEMENTED();
+    GLint old_vao;
+    gles.core.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    gles.core.glBindVertexArray(vaobj);
+    gles.core.glVertexAttribBinding(attribindex, bindingindex);
+    gles.core.glBindVertexArray(old_vao);
 }
 
 void glVertexArrayAttribFormat(GLuint vaobj, GLuint attribindex, GLint size, GLenum type, GLboolean normalized, GLuint relativeoffset) {
-    UNIMPLEMENTED();
+    GLint old_vao;
+    gles.core.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    gles.core.glBindVertexArray(vaobj);
+    gles.core.glVertexAttribFormat(attribindex, size, type, normalized, relativeoffset);
+    gles.core.glBindVertexArray(old_vao);
 }
 
 void glVertexArrayAttribIFormat(GLuint vaobj, GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset) {
-    UNIMPLEMENTED();
+    GLint old_vao;
+    gles.core.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    gles.core.glBindVertexArray(vaobj);
+    gles.core.glVertexAttribIFormat(attribindex, size, type, relativeoffset);
+    gles.core.glBindVertexArray(old_vao);
 }
 
 void glVertexArrayAttribLFormat(GLuint vaobj, GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset) {
@@ -2660,11 +2945,19 @@ void glVertexArrayBindingDivisor(GLuint vaobj, GLuint bindingindex, GLuint divis
 }
 
 void glVertexArrayElementBuffer(GLuint vaobj, GLuint buffer) {
-    UNIMPLEMENTED();
+    GLint old_vao;
+    gles.core.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    gles.core.glBindVertexArray(vaobj);
+    gles.core.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffer);
+    gles.core.glBindVertexArray(old_vao);
 }
 
 void glVertexArrayVertexBuffer(GLuint vaobj, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride) {
-    UNIMPLEMENTED();
+    GLint old_vao;
+    gles.core.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+    gles.core.glBindVertexArray(vaobj);
+    gles.core.glBindVertexBuffer(bindingindex, buffer, offset, stride);
+    gles.core.glBindVertexArray(old_vao);
 }
 
 void glVertexArrayVertexBuffers(GLuint vaobj, GLuint first, GLsizei count, const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides) {
@@ -3042,3 +3335,4 @@ void glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
 #ifdef __cplusplus
 }
 #endif
+

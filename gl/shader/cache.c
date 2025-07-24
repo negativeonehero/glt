@@ -2,7 +2,6 @@
 #include "gles.h"
 #include "sha256.h"
 
-#define STB_DS_IMPLEMENTATION
 #include "stb_ds.h"
 
 ShaderSourceEntry* g_shader_source_map = NULL;
