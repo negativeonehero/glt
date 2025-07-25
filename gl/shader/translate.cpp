@@ -1,4 +1,5 @@
 #include "translate.h"
+#include "gles.h"
 
 #include <iostream>
 #include <string>
@@ -222,7 +223,7 @@ extern "C" char* shader_translate(GLenum shader_type, const char* source) {
     spirv_cross::CompilerGLSL glsl(std::move(spirv));
 
     spirv_cross::CompilerGLSL::Options options;
-    options.version = 320;
+    options.version = gles_version.major * 100 + gles_version.minor * 10;
     options.es = true;
     options.force_zero_initialized_variables = true;
     glsl.set_common_options(options);

@@ -14,6 +14,11 @@
 extern "C" {
 #endif
 
+extern struct gles_version_t {
+    int major;
+    int minor;
+} gles_version;
+
 // --- GLES Struct Definitions ---
 struct gles_core_procs {
     PFNGLACTIVESHADERPROGRAMPROC glActiveShaderProgram;
@@ -932,7 +937,6 @@ struct egl_t {
     PFNEGLQUERYSTREAMTIMEKHRPROC eglQueryStreamTimeKHR;
     PFNEGLQUERYSTREAMU64KHRPROC eglQueryStreamu64KHR;
     PFNEGLQUERYSTRINGPROC eglQueryString;
-//  PFNEGLQUERYSTRINGIMPLEMENTATIONANDROIDPROC eglQueryStringImplementationANDROID;
     PFNEGLQUERYSURFACEPROC eglQuerySurface;
     PFNEGLRELEASETEXIMAGEPROC eglReleaseTexImage;
     PFNEGLRELEASETHREADPROC eglReleaseThread;
@@ -962,14 +966,23 @@ extern struct egl_t egl;
 // --- Loader Macro Definitions ---
 #ifdef __cplusplus
 // C++ versions using decltype
+
 #define LOAD_CORE_PROC(func) \
     do { \
-        gles.core.func = (decltype(gles.core.func))dlsym(handle, #func); \
+        gles.core.func = (decltype(gles.core.func))egl.eglGetProcAddress(#func); \
+        if (!gles.core.func) { \
+            gles.core.func = (decltype(gles.core.func))dlsym(handle, #func); \
+        } \
         if (!gles.core.func) { fprintf(stderr, "Loader: Failed to load GLES core '%s'\n", #func); } \
     } while (0)
 
 #define LOAD_EXT_PROC(func) \
-    do { gles.ext.func = (decltype(gles.ext.func))dlsym(handle, #func); } while (0)
+    do { \
+        gles.ext.func = (decltype(gles.ext.func))egl.eglGetProcAddress(#func); \
+        if (!gles.ext.func) { \
+            gles.ext.func = (decltype(gles.ext.func))dlsym(handle, #func); \
+        } \
+    } while (0)
 
 #define LOAD_EGL_PROC(func) \
     do { \
@@ -981,12 +994,20 @@ extern struct egl_t egl;
 // C versions requiring explicit types
 #define LOAD_CORE_PROC(func, type) \
     do { \
-        gles.core.func = (type)dlsym(handle, #func); \
+        gles.core.func = (type)egl.eglGetProcAddress(#func); \
+        if (!gles.core.func) { \
+            gles.core.func = (type)dlsym(handle, #func); \
+        } \
         if (!gles.core.func) { fprintf(stderr, "Loader: Failed to load GLES core '%s'\n", #func); } \
     } while (0)
 
 #define LOAD_EXT_PROC(func, type) \
-    do { gles.ext.func = (type)dlsym(handle, #func); } while (0)
+    do { \
+        gles.ext.func = (type)egl.eglGetProcAddress(#func); \
+        if (!gles.ext.func) { \
+            gles.ext.func = (type)dlsym(handle, #func); \
+        } \
+    } while (0)
 
 #define LOAD_EGL_PROC(func, type) \
     do { \

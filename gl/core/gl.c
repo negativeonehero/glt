@@ -1218,7 +1218,7 @@ const GLubyte* glGetString(GLenum name) {
     switch (name) {
         case GL_VERSION: {
             const char* gles_version = (const char*)gles.core.glGetString(GL_VERSION);
-            snprintf(version_str, sizeof(version_str), "4.6 Core Profile | %s", gles_version);
+            snprintf(version_str, sizeof(version_str), "OpenGL 4.6 Core Profile | %s", gles_version);
 
             return (const GLubyte*)version_str;
         }
@@ -1237,7 +1237,7 @@ const GLubyte* glGetString(GLenum name) {
 
         case GL_SHADING_LANGUAGE_VERSION: {
             const char* gles_sl_version = (const char*)gles.core.glGetString(GL_SHADING_LANGUAGE_VERSION);
-            snprintf(sl_version_str, sizeof(sl_version_str), "4.60 | %s", gles_sl_version);
+            snprintf(sl_version_str, sizeof(sl_version_str), "OpenGL GLSL 4.60 | %s", gles_sl_version);
             return (const GLubyte*)sl_version_str;
         }
 

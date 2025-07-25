@@ -10,6 +10,12 @@ int load_gles_functions(void* handle) {
         return -1;
     }
 
+    // This check is now crucial
+    if (!egl.eglGetProcAddress) {
+        fprintf(stderr, "Loader: eglGetProcAddress not loaded. Cannot load GLES functions. (Did you call load_egl_functions first?)\n");
+        return -1;
+    }
+
     // Load Core GLES Functions
     LOAD_CORE_PROC(glActiveShaderProgram, PFNGLACTIVESHADERPROGRAMPROC);
     LOAD_CORE_PROC(glActiveTexture, PFNGLACTIVETEXTUREPROC);
@@ -933,7 +939,6 @@ int load_egl_functions(void* handle) {
     LOAD_EGL_PROC(eglQueryStreamTimeKHR, PFNEGLQUERYSTREAMTIMEKHRPROC);
     LOAD_EGL_PROC(eglQueryStreamu64KHR, PFNEGLQUERYSTREAMU64KHRPROC);
     LOAD_EGL_PROC(eglQueryString, PFNEGLQUERYSTRINGPROC);
-//  LOAD_EGL_PROC(eglQueryStringImplementationANDROID, PFNEGLQUERYSTRINGIMPLEMENTATIONANDROIDPROC);
     LOAD_EGL_PROC(eglQuerySurface, PFNEGLQUERYSURFACEPROC);
     LOAD_EGL_PROC(eglReleaseTexImage, PFNEGLRELEASETEXIMAGEPROC);
     LOAD_EGL_PROC(eglReleaseThread, PFNEGLRELEASETHREADPROC);
@@ -956,8 +961,8 @@ int load_egl_functions(void* handle) {
     LOAD_EGL_PROC(eglWaitSyncKHR, PFNEGLWAITSYNCKHRPROC);
 
     // Final check for critical EGL functions
-    if (!egl.eglGetDisplay || !egl.eglInitialize || !egl.eglSwapBuffers) {
-        fprintf(stderr, "Loader: CRITICAL FAILURE. Essential EGL functions could not be loaded.\n");
+    if (!egl.eglGetDisplay || !egl.eglInitialize || !egl.eglGetProcAddress) {
+        fprintf(stderr, "Loader: CRITICAL FAILURE. Essential EGL functions (including eglGetProcAddress) could not be loaded.\n");
         return -1;
     }
     return 0;
