@@ -5,6 +5,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <setjmp.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -16,6 +18,7 @@ void* get_egl_lib_handle();
 
 // --- Global State for the Bridge ---
 static bool g_bridge_initialized = false;
+static bool g_egl_initialized = false;
 static EGLDisplay g_egl_display = EGL_NO_DISPLAY;
 static EGLConfig  g_egl_config = NULL;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
@@ -43,55 +46,47 @@ static ShimMode g_shim_mode = SHIM_MODE_UNINITIALIZED;
 
 static void ensure_bridge_initialized() {
     if (g_bridge_initialized) return;
-    fprintf(stderr, "[Bridge] First GLX call intercepted. Performing Pbuffer initialization...\n");
+    fprintf(stderr, "[Bridge] First GLX call intercepted. Loading function pointers...\n");
     void* egl_handle = get_egl_lib_handle();
     if (!egl_handle) { fprintf(stderr, "[Bridge] FATAL: EGL library handle is NULL.\n"); exit(1); }
     if (!egl.eglGetProcAddress) {
         egl.eglGetProcAddress = (PFNEGLGETPROCADDRESSPROC)dlsym(egl_handle, "eglGetProcAddress");
         if (!egl.eglGetProcAddress) { fprintf(stderr, "[Bridge] FATAL: Could not dlsym eglGetProcAddress.\n"); exit(1); }
     }
-    EGLDisplay temp_dpy = egl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (temp_dpy == EGL_NO_DISPLAY) { fprintf(stderr, "[Bridge] Pbuffer init failed: eglGetDisplay returned EGL_NO_DISPLAY.\n"); exit(1); }
-    if (egl.eglInitialize(temp_dpy, NULL, NULL) != EGL_TRUE) { fprintf(stderr, "[Bridge] Pbuffer init failed: eglInitialize failed (0x%x).\n", egl.eglGetError()); exit(1); }
-    EGLint config_attribs[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE };
-    EGLConfig config; EGLint num_config;
-    if (egl.eglChooseConfig(temp_dpy, config_attribs, &config, 1, &num_config) != EGL_TRUE || num_config == 0) { fprintf(stderr, "[Bridge] Pbuffer init failed: eglChooseConfig failed (0x%x).\n", egl.eglGetError()); exit(1); }
-    EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    EGLContext temp_ctx = egl.eglCreateContext(temp_dpy, config, EGL_NO_CONTEXT, ctx_attribs);
-    if (temp_ctx == EGL_NO_CONTEXT) { fprintf(stderr, "[Bridge] Pbuffer init failed: eglCreateContext failed (0x%x).\n", egl.eglGetError()); exit(1); }
-    EGLint pbuf_attribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
-    EGLSurface temp_surf = egl.eglCreatePbufferSurface(temp_dpy, config, pbuf_attribs);
-    if (temp_surf == EGL_NO_SURFACE) { fprintf(stderr, "[Bridge] Pbuffer init failed: eglCreatePbufferSurface failed (0x%x).\n", egl.eglGetError()); exit(1); }
-    if (egl.eglMakeCurrent(temp_dpy, temp_surf, temp_surf, temp_ctx) != EGL_TRUE) { fprintf(stderr, "[Bridge] Pbuffer init failed: eglMakeCurrent failed (0x%x).\n", egl.eglGetError()); exit(1); }
-    fprintf(stderr, "[Bridge] Temporary context active. Re-loading GLES function pointers...\n");
-    if (load_gles_functions(get_gles_lib_handle()) != 0) { fprintf(stderr, "[Bridge] FATAL: Failed to re-bind GLES functions.\n"); exit(1); }
-    fprintf(stderr, "[Bridge] GLES functions re-loaded successfully.\n");
-    egl.eglMakeCurrent(temp_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    egl.eglDestroySurface(temp_dpy, temp_surf);
-    egl.eglDestroyContext(temp_dpy, temp_ctx);
-    egl.eglTerminate(temp_dpy);
+    load_gles_functions(get_gles_lib_handle());
     g_bridge_initialized = true;
-    fprintf(stderr, "[Bridge] Pbuffer initialization complete.\n");
+    fprintf(stderr, "[Bridge] Function pointers loaded.\n");
 }
 
 static void ensure_egl_display(Display* dpy) {
-    if (g_egl_display != EGL_NO_DISPLAY) return;
-
-    printf("[Bridge] Initializing EGL display for application...\n");
-
-    g_egl_display = egl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (g_egl_initialized) return;
+    printf("[Bridge] Initializing EGL display...\n");
+    if (egl.eglGetPlatformDisplay) {
+        g_egl_display = egl.eglGetPlatformDisplay(EGL_PLATFORM_X11_KHR, (void*)dpy, NULL);
+    }
+    if (g_egl_display != EGL_NO_DISPLAY) {
+        printf("[Bridge] Successfully got EGL display via eglGetPlatformDisplay.\n");
+    } else {
+        printf("[Bridge] eglGetPlatformDisplay failed or unavailable. Falling back to eglGetDisplay.\n");
+        g_egl_display = egl.eglGetDisplay((EGLNativeDisplayType)dpy);
+    }
+    if (g_egl_display == EGL_NO_DISPLAY) {
+        printf("[Bridge] eglGetDisplay with X11 Display failed. Falling back to EGL_DEFAULT_DISPLAY.\n");
+        g_egl_display = egl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    }
 
     if (g_egl_display == EGL_NO_DISPLAY) {
-        fprintf(stderr, "[Bridge] FATAL: eglGetDisplay(EGL_DEFAULT_DISPLAY) failed.\n");
+        fprintf(stderr, "[Bridge] FATAL: All attempts to get an EGL display failed.\n");
         exit(1);
     }
 
     EGLint major, minor;
     if (!egl.eglInitialize(g_egl_display, &major, &minor)) {
-        fprintf(stderr, "[Bridge] FATAL: eglInitialize failed for the application display (0x%x).\n", egl.eglGetError());
+        fprintf(stderr, "[Bridge] FATAL: eglInitialize failed (0x%x).\n", egl.eglGetError());
         exit(1);
     }
-    printf("[Bridge] EGL Initialized for application: Version %d.%d\n", major, minor);
+    printf("[Bridge] EGL Initialized: Version %d.%d\n", major, minor);
+    g_egl_initialized = true;
 }
 
 // =================================================================================================
@@ -161,36 +156,48 @@ GLXContext glXCreateContextAttribsARB(Display* dpy, GLXFBConfig config, GLXConte
     return (GLXContext)g_egl_context;
 }
 
+// If EGL doesn't support X11 (Android), passing the X11 window handler to EGL will cause a crash.
+// We'll handle the crash to at least allow the PBuffer path to work.
+static jmp_buf g_crash_recovery_buffer;
+static void sigsegv_handler(int sig) {
+    longjmp(g_crash_recovery_buffer, 1);
+}
+
 Bool glXMakeContextCurrent(Display* dpy, GLXDrawable draw, GLXDrawable read, GLXContext ctx) {
     ensure_bridge_initialized();
+    ensure_egl_display(dpy);
+
     if (g_current_drawable != draw) {
-        if (g_egl_surface != EGL_NO_SURFACE) {
-            egl.eglDestroySurface(g_egl_display, g_egl_surface);
-            g_egl_surface = EGL_NO_SURFACE;
-        }
-        if (g_pixel_buffer) {
-            free(g_pixel_buffer);
-            g_pixel_buffer = NULL;
-        }
+        if (g_egl_surface != EGL_NO_SURFACE) { egl.eglDestroySurface(g_egl_display, g_egl_surface); g_egl_surface = EGL_NO_SURFACE; }
+        if (g_pixel_buffer) { free(g_pixel_buffer); g_pixel_buffer = NULL; }
         g_shim_mode = SHIM_MODE_UNINITIALIZED;
 
         if (draw != 0) {
-            printf("[Bridge] Attempting to create a native EGL window surface (fast path)...\n");
-            g_egl_surface = egl.eglCreateWindowSurface(g_egl_display, g_egl_config, (EGLNativeWindowType)draw, NULL);
+            bool native_success = false;
+            struct sigaction new_action = { .sa_handler = sigsegv_handler };
+            struct sigaction old_action;
+            sigemptyset(&new_action.sa_mask);
+            if (setjmp(g_crash_recovery_buffer) == 0) {
+                sigaction(SIGSEGV, &new_action, &old_action);
+                printf("[Bridge] Attempting to create a native EGL window surface (fast path)...\n");
+                g_egl_surface = egl.eglCreateWindowSurface(g_egl_display, g_egl_config, (EGLNativeWindowType)draw, NULL);
+                sigaction(SIGSEGV, &old_action, NULL);
 
-            if (g_egl_surface != EGL_NO_SURFACE) {
+                if (g_egl_surface != EGL_NO_SURFACE) {
+                    native_success = true;
+                }
+            }
+            if (native_success) {
                 printf("[Bridge] Success! Using native EGL window surface.\n");
                 g_shim_mode = SHIM_MODE_NATIVE_X11;
             } else {
-                fprintf(stderr, "[Bridge] Native window surface creation failed (EGL error: 0x%x).\n", egl.eglGetError());
-                fprintf(stderr, "[Bridge] Falling back to Pbuffer copy method (slower path).\n");
-
+                // This block is reached if eglCreateWindowSurface returned an error OR if it crashed.
+                fprintf(stderr, "[Bridge] Native window surface creation failed. Falling back to Pbuffer copy method.\n");
+                // --- Fallback to the Pbuffer copy method ---
                 Window root; int x, y; unsigned int w, h, border, depth;
                 XGetGeometry(dpy, draw, &root, &x, &y, &w, &h, &border, &depth);
-                g_window_width = w;
-                g_window_height = h;
+                g_window_width = w; g_window_height = h;
                 g_pixel_buffer = malloc(w * h * 4);
-
                 const EGLint pbuf_attribs[] = { EGL_WIDTH, w, EGL_HEIGHT, h, EGL_NONE };
                 g_egl_surface = egl.eglCreatePbufferSurface(g_egl_display, g_egl_config, pbuf_attribs);
 
@@ -199,15 +206,15 @@ Bool glXMakeContextCurrent(Display* dpy, GLXDrawable draw, GLXDrawable read, GLX
                     g_shim_mode = SHIM_MODE_PBUFFER_COPY;
                 } else {
                     fprintf(stderr, "[Bridge] FATAL: Fallback Pbuffer surface creation also failed (EGL error: 0x%x).\n", egl.eglGetError());
-                    free(g_pixel_buffer);
-                    g_pixel_buffer = NULL;
+                    free(g_pixel_buffer); g_pixel_buffer = NULL;
                     return False;
                 }
             }
         }
         g_current_drawable = draw;
     }
-    return egl.eglMakeCurrent(g_egl_display, g_egl_surface, g_egl_surface, (EGLContext)ctx);
+    if (!egl.eglMakeCurrent(g_egl_display, g_egl_surface, g_egl_surface, (EGLContext)ctx)) return False;
+    return True;
 }
 
 void glXSwapBuffers(Display* dpy, GLXDrawable drawable) {

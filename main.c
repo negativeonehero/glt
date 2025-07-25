@@ -38,10 +38,6 @@ void initialize_translation_layer() {
         fprintf(stderr, "Layer: Failed to bind EGL functions. Aborting.\n");
         exit(1);
     }
-    // GLES functions will likely fail to load correctly here, but we call it anyway.
-    // The real load will happen in the GLX bridge.
-    load_gles_functions(gles_handle);
-
     shader_cache_init();
     fprintf(stderr, "--- Translation Layer Initialized Successfully (pre-bridge) ---\n");
 }
