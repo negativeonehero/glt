@@ -29,6 +29,14 @@ static int g_window_width = 0;
 static int g_window_height = 0;
 struct gles_version_t gles_version;
 
+typedef enum {
+    SHIM_MODE_UNINITIALIZED, // No surface has been created yet
+    SHIM_MODE_NATIVE_X11,    // Using a native EGL window surface (fast path)
+    SHIM_MODE_PBUFFER_COPY   // Using a Pbuffer with glReadPixels (fallback path)
+} ShimMode;
+
+static ShimMode g_shim_mode = SHIM_MODE_UNINITIALIZED;
+
 // =================================================================================================
 //                                     INITIALIZATION LOGIC
 // =================================================================================================
@@ -95,24 +103,23 @@ GLXFBConfig* glXChooseFBConfig(Display* dpy, int screen, const int* attrib_list,
     printf("[Bridge] Intercepted glXChooseFBConfig\n");
     ensure_egl_display(dpy);
 
-    // Request a config that supports Pbuffers, as this will be our rendering target.
     const EGLint egl_attribs[] = {
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
         EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE
     };
 
     EGLint num_config;
     if (!egl.eglChooseConfig(g_egl_display, egl_attribs, NULL, 0, &num_config) || num_config == 0) {
-        fprintf(stderr, "[Bridge] eglChooseConfig failed to find any Pbuffer configs.\n");
-        *nelements = 0;
-        return NULL;
+        fprintf(stderr, "[Bridge] eglChooseConfig failed to find any suitable configs.\n");
+        *nelements = 0; return NULL;
     }
     EGLConfig* configs = (EGLConfig*)malloc(num_config * sizeof(EGLConfig));
     if (!egl.eglChooseConfig(g_egl_display, egl_attribs, configs, num_config, &num_config)) {
         free(configs); *nelements = 0; return NULL;
     }
-    printf("[Bridge] Found %d matching EGL Pbuffer configs.\n", num_config);
+    printf("[Bridge] Found %d matching EGL configs.\n", num_config);
     *nelements = num_config;
     return (GLXFBConfig*)configs;
 }
@@ -121,8 +128,7 @@ XVisualInfo* glXGetVisualFromFBConfig(Display* dpy, GLXFBConfig config) {
     ensure_bridge_initialized();
     printf("[Bridge] Intercepted glXGetVisualFromFBConfig\n");
     printf("[Bridge] Providing screen's default visual to prevent XCreateWindow BadMatch.\n");
-    
-    // This logic is critical to prevent the application from crashing when it creates its X window.
+
     int screen = DefaultScreen(dpy);
     Visual* default_visual = DefaultVisual(dpy, screen);
     XVisualInfo visual_template = { .visualid = XVisualIDFromVisual(default_visual) };
@@ -158,7 +164,6 @@ GLXContext glXCreateContextAttribsARB(Display* dpy, GLXFBConfig config, GLXConte
 Bool glXMakeContextCurrent(Display* dpy, GLXDrawable draw, GLXDrawable read, GLXContext ctx) {
     ensure_bridge_initialized();
     if (g_current_drawable != draw) {
-        // Clean up old surface and pixel buffer
         if (g_egl_surface != EGL_NO_SURFACE) {
             egl.eglDestroySurface(g_egl_display, g_egl_surface);
             g_egl_surface = EGL_NO_SURFACE;
@@ -167,27 +172,37 @@ Bool glXMakeContextCurrent(Display* dpy, GLXDrawable draw, GLXDrawable read, GLX
             free(g_pixel_buffer);
             g_pixel_buffer = NULL;
         }
+        g_shim_mode = SHIM_MODE_UNINITIALIZED;
 
         if (draw != 0) {
-            // Get the geometry of the target X11 window
-            Window root;
-            int x, y;
-            unsigned int w, h, border, depth;
-            XGetGeometry(dpy, draw, &root, &x, &y, &w, &h, &border, &depth);
-            g_window_width = w;
-            g_window_height = h;
+            printf("[Bridge] Attempting to create a native EGL window surface (fast path)...\n");
+            g_egl_surface = egl.eglCreateWindowSurface(g_egl_display, g_egl_config, (EGLNativeWindowType)draw, NULL);
 
-            printf("[Bridge] Creating new Pbuffer surface with dimensions %dx%d.\n", w, h);
+            if (g_egl_surface != EGL_NO_SURFACE) {
+                printf("[Bridge] Success! Using native EGL window surface.\n");
+                g_shim_mode = SHIM_MODE_NATIVE_X11;
+            } else {
+                fprintf(stderr, "[Bridge] Native window surface creation failed (EGL error: 0x%x).\n", egl.eglGetError());
+                fprintf(stderr, "[Bridge] Falling back to Pbuffer copy method (slower path).\n");
 
-            // Allocate our CPU-side buffer for reading pixels into
-            g_pixel_buffer = malloc(w * h * 4);
+                Window root; int x, y; unsigned int w, h, border, depth;
+                XGetGeometry(dpy, draw, &root, &x, &y, &w, &h, &border, &depth);
+                g_window_width = w;
+                g_window_height = h;
+                g_pixel_buffer = malloc(w * h * 4);
 
-            // Create an EGL Pbuffer surface with the same dimensions
-            const EGLint pbuf_attribs[] = { EGL_WIDTH, w, EGL_HEIGHT, h, EGL_NONE };
-            g_egl_surface = egl.eglCreatePbufferSurface(g_egl_display, g_egl_config, pbuf_attribs);
-            if (g_egl_surface == EGL_NO_SURFACE) {
-                fprintf(stderr, "[Bridge] eglCreatePbufferSurface failed! EGL error: 0x%x\n", egl.eglGetError());
-                return False;
+                const EGLint pbuf_attribs[] = { EGL_WIDTH, w, EGL_HEIGHT, h, EGL_NONE };
+                g_egl_surface = egl.eglCreatePbufferSurface(g_egl_display, g_egl_config, pbuf_attribs);
+
+                if (g_egl_surface != EGL_NO_SURFACE) {
+                    printf("[Bridge] Fallback Pbuffer surface created successfully.\n");
+                    g_shim_mode = SHIM_MODE_PBUFFER_COPY;
+                } else {
+                    fprintf(stderr, "[Bridge] FATAL: Fallback Pbuffer surface creation also failed (EGL error: 0x%x).\n", egl.eglGetError());
+                    free(g_pixel_buffer);
+                    g_pixel_buffer = NULL;
+                    return False;
+                }
             }
         }
         g_current_drawable = draw;
@@ -197,33 +212,35 @@ Bool glXMakeContextCurrent(Display* dpy, GLXDrawable draw, GLXDrawable read, GLX
 
 void glXSwapBuffers(Display* dpy, GLXDrawable drawable) {
     ensure_bridge_initialized();
-    if (!g_egl_surface || !g_pixel_buffer || !gles.core.glReadPixels) return;
 
-    // NOTE: A more robust implementation would handle window resizing here by
-    // destroying and recreating the pbuffer and pixel buffer.
+    switch (g_shim_mode) {
+        case SHIM_MODE_NATIVE_X11:
+            // FAST PATH: The driver handles the swap directly.
+            egl.eglSwapBuffers(g_egl_display, g_egl_surface);
+            break;
 
-    // 1. Read pixels from the off-screen EGL Pbuffer into our CPU buffer.
-    gles.core.glReadPixels(0, 0, g_window_width, g_window_height, GL_RGBA, GL_UNSIGNED_BYTE, g_pixel_buffer);
+        case SHIM_MODE_PBUFFER_COPY:
+            // FALLBACK PATH: We must manually copy pixels from our off-screen Pbuffer.
+            if (!g_pixel_buffer || !gles.core.glReadPixels) return;
 
-    // 2. Create an XImage that wraps our CPU buffer.
-    XImage* image = XCreateImage(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
-                                 DefaultDepth(dpy, DefaultScreen(dpy)), ZPixmap, 0,
-                                 (char*)g_pixel_buffer, g_window_width, g_window_height, 32, 0);
-    if (!image) {
-        fprintf(stderr, "[Bridge] XCreateImage failed!\n");
-        return;
+            gles.core.glReadPixels(0, 0, g_window_width, g_window_height, GL_RGBA, GL_UNSIGNED_BYTE, g_pixel_buffer);
+
+            XImage* image = XCreateImage(dpy, DefaultVisual(dpy, DefaultScreen(dpy)),
+                                         DefaultDepth(dpy, DefaultScreen(dpy)), ZPixmap, 0,
+                                         (char*)g_pixel_buffer, g_window_width, g_window_height, 32, 0);
+            if (!image) { fprintf(stderr, "[Bridge] XCreateImage failed!\n"); return; }
+            GC gc = XCreateGC(dpy, drawable, 0, NULL);
+            XPutImage(dpy, drawable, gc, image, 0, 0, 0, 0, g_window_width, g_window_height);
+            XFreeGC(dpy, gc);
+            XFlush(dpy);
+
+            image->data = NULL;
+            XDestroyImage(image);
+            break;
+        case SHIM_MODE_UNINITIALIZED:
+            // No surface is current, do nothing.
+            break;
     }
-
-    // 3. Blit the image to the real X11 window.
-    GC gc = XCreateGC(dpy, drawable, 0, NULL);
-    XPutImage(dpy, drawable, gc, image, 0, 0, 0, 0, g_window_width, g_window_height);
-    XFreeGC(dpy, gc);
-    XFlush(dpy);
-
-    // XDestroyImage also frees the data buffer it points to. We must prevent this
-    // as we manage the buffer's memory ourselves.
-    image->data = NULL;
-    XDestroyImage(image);
 }
 
 // --- Aliases, Legacy Functions, and Info Functions ---
